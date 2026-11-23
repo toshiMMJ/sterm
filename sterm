@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+#
+# sterm - connect to an EC2 instance over ssh through AWS Systems Manager (SSM) Session Manager
+#
+# Instead of
+#   ssh -i ~/.ssh/id_rsa ubuntu@fqdn
+# you can connect with
+#   sterm ubuntu@EC2-instance-name
+# It accepts the same arguments as ssh and passes them through unchanged.
+#
+# How it works:
+#   1. Find the ssh destination ([user@]host or ssh://[user@]host[:port]) in the arguments.
+#   2. Treat host as an EC2 Name tag and resolve it to an instance ID with aws ec2 describe-instances
+#      (skipped when an i-xxxx / mi-xxxx ID is given directly).
+#   3. Replace the host part of the destination with the instance ID and exec ssh
+#      with aws ssm start-session (AWS-StartSSHSession) as the ProxyCommand.
+#
+# Written to also run on bash 3.2 (the macOS default).
+
+set -o pipefail
+
+PROG=${0##*/}
+
+# ssh option letters that take an argument (from the OpenSSH usage)
+SSH_OPTS_WITH_ARG="BbcDEeFIiJLlmOoPpQRSWw"
+
+# Pattern treated as an instance ID (EC2: i-xxxx, hybrid managed instance: mi-xxxx)
+INSTANCE_ID_RE='^m?i-[0-9a-f]{8,17}$'
+
+die() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [--profile PROFILE] [--region REGION] [ssh options] [user@]instance-name [command ...]
+
+Connect to an EC2 instance over ssh through AWS SSM Session Manager.
+instance-name is the value of the EC2 Name tag (wildcards * are allowed).
+You can also give an instance ID (i-xxxxxxxx) directly.
+
+sterm options (must come before the destination):
+  --profile PROFILE   AWS profile to use (sets AWS_PROFILE)
+  --region REGION     AWS region to use (sets AWS_REGION)
+  --help              show this help
+
+All other arguments are passed to ssh unchanged.
+
+Examples:
+  $PROG ubuntu@web-server
+  $PROG -i ~/.ssh/id_rsa ubuntu@web-server
+  $PROG -L 8080:localhost:80 ubuntu@web-server
+  $PROG --profile prod --region ap-northeast-1 ec2-user@batch-01 uptime
+  scp -S $PROG ./file.txt ubuntu@web-server:/tmp/
+EOF
+}
+
+# Escape a string for use inside a JSON string literal
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+# Resolve a Name tag to an instance ID and store the result in INSTANCE_ID
+resolve_instance() {
+    local name=$1
+    local out filters query
+    local ids=() states=() ips=() names=()
+    local run_ids=() run_ips=() run_names=()
+    local id state ip tagname i n ans
+
+    filters="[{\"Name\":\"tag:Name\",\"Values\":[\"$(json_escape "$name")\"]},"
+    filters+="{\"Name\":\"instance-state-name\",\"Values\":[\"pending\",\"running\",\"stopping\",\"stopped\"]}]"
+    query='Reservations[].Instances[].[InstanceId,State.Name,PrivateIpAddress,Tags[?Key==`Name`]|[0].Value]'
+
+    out=$(aws ec2 describe-instances --filters "$filters" --query "$query" --output text) ||
+        die "failed to look up instances (aws ec2 describe-instances)"
+
+    while IFS=$'\t' read -r id state ip tagname; do
+        [ -n "$id" ] || continue
+        ids+=("$id")
+        states+=("$state")
+        ips+=("$ip")
+        names+=("$tagname")
+        if [ "$state" = "running" ]; then
+            run_ids+=("$id")
+            run_ips+=("$ip")
+            run_names+=("$tagname")
+        fi
+    done <<EOF
+$out
+EOF
+
+    if [ ${#ids[@]} -eq 0 ]; then
+        die "no instance found with Name tag \"$name\" (region: ${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null)}})"
+    fi
+
+    if [ ${#run_ids[@]} -eq 0 ]; then
+        {
+            printf '%s: no running instance matches "%s":\n' "$PROG" "$name"
+            i=0
+            while [ $i -lt ${#ids[@]} ]; do
+                printf '  %s  %-8s  %s\n' "${ids[$i]}" "${states[$i]}" "${names[$i]}"
+                i=$((i + 1))
+            done
+        } >&2
+        exit 1
+    fi
+
+    if [ ${#run_ids[@]} -eq 1 ]; then
+        INSTANCE_ID=${run_ids[0]}
+        return 0
+    fi
+
+    # Multiple matches: let the user pick one on a terminal, otherwise fail
+    n=${#run_ids[@]}
+    {
+        printf '%s: multiple running instances match "%s":\n' "$PROG" "$name"
+        i=0
+        while [ $i -lt "$n" ]; do
+            printf '  %d) %s  %-15s  %s\n' $((i + 1)) "${run_ids[$i]}" "${run_ips[$i]}" "${run_names[$i]}"
+            i=$((i + 1))
+        done
+    } >&2
+
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        die "cannot pick a unique destination; specify the instance ID directly"
+    fi
+
+    while :; do
+        printf 'Select a number [1-%d]: ' "$n" >&2
+        read -r ans || { echo >&2; exit 1; }
+        case $ans in
+            '' | *[!0-9]*) ;;
+            *)
+                if [ "$ans" -ge 1 ] && [ "$ans" -le "$n" ]; then
+                    INSTANCE_ID=${run_ids[$((ans - 1))]}
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+#   arguments before the destination -> pre_args
+#   the destination                  -> dest
+#   arguments after the destination  -> "$@" (ssh still parses options here,
+#                                       but passing them through unchanged is enough)
+# ---------------------------------------------------------------------------
+pre_args=()
+dest=""
+found_dest=0
+verbose=0
+
+while [ $# -gt 0 ]; do
+    arg=$1
+    shift
+    case $arg in
+        --help)
+            usage
+            exit 0
+            ;;
+        --profile)
+            [ $# -gt 0 ] || die "--profile requires a value"
+            export AWS_PROFILE=$1
+            shift
+            ;;
+        --profile=*)
+            export AWS_PROFILE=${arg#*=}
+            ;;
+        --region)
+            [ $# -gt 0 ] || die "--region requires a value"
+            export AWS_REGION=$1
+            shift
+            ;;
+        --region=*)
+            export AWS_REGION=${arg#*=}
+            ;;
+        --)
+            pre_args+=("$arg")
+            if [ $# -gt 0 ]; then
+                dest=$1
+                shift
+                found_dest=1
+            fi
+            break
+            ;;
+        --*)
+            die "unknown option: $arg (see $PROG --help)"
+            ;;
+        -?*)
+            # Walk the letters one by one to handle bundled forms like -vA, -ikey, -i key
+            pre_args+=("$arg")
+            j=1
+            while [ $j -lt ${#arg} ]; do
+                c=${arg:$j:1}
+                [ "$c" = "v" ] && verbose=$((verbose + 1))
+                case $SSH_OPTS_WITH_ARG in
+                    *"$c"*)
+                        # If no letters remain, the next argument is the option's value
+                        if [ $((j + 1)) -ge ${#arg} ] && [ $# -gt 0 ]; then
+                            pre_args+=("$1")
+                            shift
+                        fi
+                        break
+                        ;;
+                esac
+                j=$((j + 1))
+            done
+            ;;
+        *)
+            dest=$arg
+            found_dest=1
+            break
+            ;;
+    esac
+done
+
+# No destination (e.g. sterm -V, sterm -Q cipher): leave everything to ssh as-is
+if [ $found_dest -eq 0 ]; then
+    exec ssh "${pre_args[@]}"
+fi
+
+command -v aws >/dev/null 2>&1 ||
+    die "aws command not found; please install the AWS CLI"
+command -v session-manager-plugin >/dev/null 2>&1 ||
+    die "session-manager-plugin not found; install it as described at https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+
+# ---------------------------------------------------------------------------
+# Split the destination: [ssh://][user@]host[:port]
+# ---------------------------------------------------------------------------
+scheme=""
+rest=$dest
+case $rest in
+    ssh://*)
+        scheme="ssh://"
+        rest=${rest#ssh://}
+        rest=${rest%/}
+        ;;
+esac
+
+userpart=""
+case $rest in
+    *@*)
+        # Split on the last @, as ssh does
+        userpart="${rest%@*}@"
+        rest=${rest##*@}
+        ;;
+esac
+
+host=$rest
+portpart=""
+if [ -n "$scheme" ]; then
+    case $rest in
+        *:*)
+            host=${rest%%:*}
+            portpart=":${rest#*:}"
+            ;;
+    esac
+fi
+
+[ -n "$host" ] || die "empty host name in destination: $dest"
+
+if [[ $host =~ $INSTANCE_ID_RE ]]; then
+    INSTANCE_ID=$host
+else
+    INSTANCE_ID=""
+    resolve_instance "$host"
+    [ $verbose -gt 0 ] && printf '%s: "%s" -> %s\n' "$PROG" "$host" "$INSTANCE_ID" >&2
+fi
+
+new_dest="${scheme}${userpart}${INSTANCE_ID}${portpart}"
+
+# %h expands to the rewritten host name (= the instance ID) and %p to the port (default 22).
+# The AWS_PROFILE / AWS_REGION environment variables are inherited by the ProxyCommand too.
+proxy_cmd='aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p'
+
+exec ssh -o "ProxyCommand=$proxy_cmd" "${pre_args[@]}" "$new_dest" "$@"
