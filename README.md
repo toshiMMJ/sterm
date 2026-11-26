@@ -23,6 +23,7 @@ The instance does not need a public IP or an open inbound port 22.
 
 - `ec2:DescribeInstances`
 - `ssm:StartSession` (for the target instance and `arn:aws:ssm:*:*:document/AWS-StartSSHSession`)
+- `ssm:StartSession` (for the target instance and `arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession`, only when using `sproxy`)
 
 ### Target instance
 
@@ -34,7 +35,7 @@ The instance does not need a public IP or an open inbound port 22.
 ## Installation
 
 ```sh
-install -m 755 sterm /usr/local/bin/sterm
+install -m 755 sterm sproxy /usr/local/bin/
 ```
 
 ## Usage
@@ -91,6 +92,33 @@ ssh -o 'ProxyCommand=aws ssm start-session --target %h --document-name AWS-Start
     ubuntu@i-0123456789abcdef0
 ```
 
+## sproxy
+
+Start only the SSM port-forwarding proxy. Target lookup matches sterm: a Name tag, a wildcard, or an instance ID. ssh is not started.
+
+```
+sproxy [--profile PROFILE] [--region REGION] [--port PORT] [--local-port PORT] [user@]instance-name[:port]
+```
+
+```sh
+sproxy web-server                              # 127.0.0.1:2222 -> instance:22
+sproxy ubuntu@web-server
+sproxy --local-port 2201 ubuntu@web-server
+sproxy --port 5432 --local-port 15432 db-01
+sproxy i-0123456789abcdef0
+sproxy 'web-*'                                 # wildcard (pick by number if multiple match)
+```
+
+The process stays in the foreground. Connect from another terminal:
+
+```sh
+ssh -p 2222 ubuntu@127.0.0.1
+```
+
+`--port` is the port on the instance (default 22). `--local-port` is the local listen port (default 2222 when the remote port is 22, otherwise the same as `--port`). An optional `user@` prefix is printed in the ssh hint only. `i-xxxxxxxx` / `mi-xxxxxxxx` skips the Name tag search. `--profile` / `--region` work the same way as in sterm.
+
+The session uses `AWS-StartPortForwardingSession`, so `ssm:StartSession` is also required for `arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession`. The instance still needs a listening service on the remote port (sshd for port 22); that port does not need to be open to the internet.
+
 ---
 
 # sterm (日本語)
@@ -118,6 +146,7 @@ EC2 の Name タグからインスタンス ID を引き、SSM のトンネル (
 
 - `ec2:DescribeInstances`
 - `ssm:StartSession` (対象インスタンスと `arn:aws:ssm:*:*:document/AWS-StartSSHSession` に対して)
+- `ssm:StartSession` (対象インスタンスと `arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession` に対して。`sproxy` を使う場合)
 
 ### 接続先インスタンス
 
@@ -129,7 +158,7 @@ EC2 の Name タグからインスタンス ID を引き、SSM のトンネル (
 ## インストール
 
 ```sh
-install -m 755 sterm /usr/local/bin/sterm
+install -m 755 sterm sproxy /usr/local/bin/
 ```
 
 ## 使い方
@@ -185,3 +214,30 @@ rsync -av -e sterm ./dir/ ubuntu@web-server:/tmp/dir/
 ssh -o 'ProxyCommand=aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p' \
     ubuntu@i-0123456789abcdef0
 ```
+
+## sproxy
+
+SSM のポートフォワードだけを起動します。接続先の引き方は sterm と同じで、Name タグ、ワイルドカード、インスタンス ID が使えます。ssh 自体は起動しません。
+
+```
+sproxy [--profile PROFILE] [--region REGION] [--port PORT] [--local-port PORT] [user@]インスタンス名[:port]
+```
+
+```sh
+sproxy web-server                              # 127.0.0.1:2222 -> インスタンスの 22 番
+sproxy ubuntu@web-server
+sproxy --local-port 2201 ubuntu@web-server
+sproxy --port 5432 --local-port 15432 db-01
+sproxy i-0123456789abcdef0
+sproxy 'web-*'                                 # ワイルドカード (複数ヒット時は番号で選択)
+```
+
+プロセスはフォアグラウンドのまま残ります。別の端末から接続します。
+
+```sh
+ssh -p 2222 ubuntu@127.0.0.1
+```
+
+`--port` はインスタンス側のポートです (既定は 22)。`--local-port` は手元で待ち受けるポートです (リモートポートが 22 のときは 2222、それ以外は `--port` と同じ)。`user@` は ssh のヒント表示にだけ使います。`i-xxxxxxxx` / `mi-xxxxxxxx` は Name タグを検索しません。`--profile` / `--region` は sterm と同じです。
+
+セッションは `AWS-StartPortForwardingSession` を使うため、`arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession` に対する `ssm:StartSession` も必要です。インスタンス側では指定したポートでサービスが待ち受けている必要があります (22 番なら sshd)。そのポートをインターネットに公開する必要はありません。

@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+#
+# sproxy - start only the SSM port-forwarding proxy to an EC2 instance
+#
+# sterm opens ssh through an SSM tunnel. sproxy does the same target lookup
+# (Name tag, wildcard, or instance ID) and starts the tunnel by itself:
+#
+#   sproxy ubuntu@web-server
+#   ssh -p 2222 ubuntu@127.0.0.1
+#
+# The session stays in the foreground until it is interrupted.
+#
+# Written to also run on bash 3.2 (the macOS default).
+
+set -o pipefail
+
+PROG=${0##*/}
+
+# Pattern treated as an instance ID (EC2: i-xxxx, hybrid managed instance: mi-xxxx)
+INSTANCE_ID_RE='^m?i-[0-9a-f]{8,17}$'
+
+die() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [--profile PROFILE] [--region REGION] [--port PORT] [--local-port PORT] [user@]instance-name[:port]
+
+Start an SSM port-forwarding session to an EC2 instance, without invoking ssh.
+instance-name is the value of the EC2 Name tag (wildcards * are allowed).
+You can also give an instance ID (i-xxxxxxxx) directly.
+An optional user@ prefix is used only in the ssh hint (the proxy itself does not log in).
+
+Options:
+  --profile PROFILE   AWS profile to use (sets AWS_PROFILE)
+  --region REGION     AWS region to use (sets AWS_REGION)
+  --port PORT         port on the instance (default: 22)
+  --local-port PORT   local port to listen on
+                      (default: 2222 when the remote port is 22, otherwise the same as --port)
+  -v                  print the Name tag to instance ID mapping
+  --help              show this help
+
+The process stays in the foreground. Connect from another terminal, for example:
+  ssh -p 2222 ubuntu@127.0.0.1
+
+Examples:
+  $PROG web-server
+  $PROG ubuntu@web-server
+  $PROG --local-port 2201 ubuntu@web-server
+  $PROG --port 5432 --local-port 15432 db-01
+  $PROG --profile prod --region ap-northeast-1 batch-01
+  $PROG i-0123456789abcdef0
+  $PROG 'web-*'
+EOF
+}
+
+# Escape a string for use inside a JSON string literal
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+valid_port() {
+    case $1 in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# Resolve a Name tag to an instance ID and store the result in INSTANCE_ID
+resolve_instance() {
+    local name=$1
+    local out filters query
+    local ids=() states=() ips=() names=()
+    local run_ids=() run_ips=() run_names=()
+    local id state ip tagname i n ans
+
+    filters="[{\"Name\":\"tag:Name\",\"Values\":[\"$(json_escape "$name")\"]},"
+    filters+="{\"Name\":\"instance-state-name\",\"Values\":[\"pending\",\"running\",\"stopping\",\"stopped\"]}]"
+    query='Reservations[].Instances[].[InstanceId,State.Name,PrivateIpAddress,Tags[?Key==`Name`]|[0].Value]'
+
+    out=$(aws ec2 describe-instances --filters "$filters" --query "$query" --output text) ||
+        die "failed to look up instances (aws ec2 describe-instances)"
+
+    while IFS=$'\t' read -r id state ip tagname; do
+        [ -n "$id" ] || continue
+        ids+=("$id")
+        states+=("$state")
+        ips+=("$ip")
+        names+=("$tagname")
+        if [ "$state" = "running" ]; then
+            run_ids+=("$id")
+            run_ips+=("$ip")
+            run_names+=("$tagname")
+        fi
+    done <<EOF
+$out
+EOF
+
+    if [ ${#ids[@]} -eq 0 ]; then
+        die "no instance found with Name tag \"$name\" (region: ${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null)}})"
+    fi
+
+    if [ ${#run_ids[@]} -eq 0 ]; then
+        {
+            printf '%s: no running instance matches "%s":\n' "$PROG" "$name"
+            i=0
+            while [ $i -lt ${#ids[@]} ]; do
+                printf '  %s  %-8s  %s\n' "${ids[$i]}" "${states[$i]}" "${names[$i]}"
+                i=$((i + 1))
+            done
+        } >&2
+        exit 1
+    fi
+
+    if [ ${#run_ids[@]} -eq 1 ]; then
+        INSTANCE_ID=${run_ids[0]}
+        return 0
+    fi
+
+    # Multiple matches: let the user pick one on a terminal, otherwise fail
+    n=${#run_ids[@]}
+    {
+        printf '%s: multiple running instances match "%s":\n' "$PROG" "$name"
+        i=0
+        while [ $i -lt "$n" ]; do
+            printf '  %d) %s  %-15s  %s\n' $((i + 1)) "${run_ids[$i]}" "${run_ips[$i]}" "${run_names[$i]}"
+            i=$((i + 1))
+        done
+    } >&2
+
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        die "cannot pick a unique destination; specify the instance ID directly"
+    fi
+
+    while :; do
+        printf 'Select a number [1-%d]: ' "$n" >&2
+        read -r ans || { echo >&2; exit 1; }
+        case $ans in
+            '' | *[!0-9]*) ;;
+            *)
+                if [ "$ans" -ge 1 ] && [ "$ans" -le "$n" ]; then
+                    INSTANCE_ID=${run_ids[$((ans - 1))]}
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+dest=""
+remote_port=""
+local_port=""
+port_from_opt=0
+verbose=0
+
+while [ $# -gt 0 ]; do
+    arg=$1
+    case $arg in
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        --profile)
+            [ $# -ge 2 ] || die "--profile requires a value"
+            export AWS_PROFILE=$2
+            shift 2
+            ;;
+        --profile=*)
+            export AWS_PROFILE=${arg#*=}
+            shift
+            ;;
+        --region)
+            [ $# -ge 2 ] || die "--region requires a value"
+            export AWS_REGION=$2
+            shift 2
+            ;;
+        --region=*)
+            export AWS_REGION=${arg#*=}
+            shift
+            ;;
+        --port)
+            [ $# -ge 2 ] || die "--port requires a value"
+            remote_port=$2
+            port_from_opt=1
+            shift 2
+            ;;
+        --port=*)
+            remote_port=${arg#*=}
+            port_from_opt=1
+            shift
+            ;;
+        --local-port)
+            [ $# -ge 2 ] || die "--local-port requires a value"
+            local_port=$2
+            shift 2
+            ;;
+        --local-port=*)
+            local_port=${arg#*=}
+            shift
+            ;;
+        -v)
+            verbose=$((verbose + 1))
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        --*)
+            die "unknown option: $arg (see $PROG --help)"
+            ;;
+        -*)
+            die "unknown option: $arg (see $PROG --help)"
+            ;;
+        *)
+            if [ -n "$dest" ]; then
+                die "unexpected argument: $arg"
+            fi
+            dest=$arg
+            shift
+            ;;
+    esac
+done
+
+if [ $# -gt 0 ]; then
+    if [ -n "$dest" ]; then
+        die "unexpected argument: $1"
+    fi
+    dest=$1
+    shift
+    [ $# -eq 0 ] || die "unexpected argument: $1"
+fi
+
+[ -n "$dest" ] || die "missing instance name (see $PROG --help)"
+
+command -v aws >/dev/null 2>&1 ||
+    die "aws command not found; please install the AWS CLI"
+command -v session-manager-plugin >/dev/null 2>&1 ||
+    die "session-manager-plugin not found; install it as described at https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+
+# ---------------------------------------------------------------------------
+# Split the destination: [ssh://][user@]host[:port]
+# ---------------------------------------------------------------------------
+rest=$dest
+case $rest in
+    ssh://*)
+        rest=${rest#ssh://}
+        rest=${rest%/}
+        ;;
+esac
+
+ssh_user=""
+case $rest in
+    *@*)
+        # Split on the last @, as ssh does
+        ssh_user=${rest%@*}
+        rest=${rest##*@}
+        ;;
+esac
+
+host=$rest
+dest_port=""
+case $rest in
+    *:*)
+        host=${rest%%:*}
+        dest_port=${rest#*:}
+        ;;
+esac
+
+[ -n "$host" ] || die "empty host name in destination: $dest"
+
+if [ -n "$dest_port" ]; then
+    valid_port "$dest_port" || die "invalid port in destination: $dest_port"
+    if [ "$port_from_opt" -eq 1 ] && [ "$remote_port" != "$dest_port" ]; then
+        die "remote port given both as --port ($remote_port) and in the target ($dest_port)"
+    fi
+    remote_port=$dest_port
+fi
+
+[ -n "$remote_port" ] || remote_port=22
+valid_port "$remote_port" || die "invalid port: $remote_port"
+
+if [ -z "$local_port" ]; then
+    if [ "$remote_port" = 22 ]; then
+        local_port=2222
+    else
+        local_port=$remote_port
+    fi
+fi
+valid_port "$local_port" || die "invalid local port: $local_port"
+
+if [[ $host =~ $INSTANCE_ID_RE ]]; then
+    INSTANCE_ID=$host
+else
+    INSTANCE_ID=""
+    resolve_instance "$host"
+    [ "$verbose" -gt 0 ] && printf '%s: "%s" -> %s\n' "$PROG" "$host" "$INSTANCE_ID" >&2
+fi
+
+printf '%s: forwarding 127.0.0.1:%s -> %s:%s\n' "$PROG" "$local_port" "$INSTANCE_ID" "$remote_port" >&2
+if [ "$remote_port" = 22 ]; then
+    if [ -n "$ssh_user" ]; then
+        printf '%s: ssh -p %s %s@127.0.0.1\n' "$PROG" "$local_port" "$ssh_user" >&2
+    else
+        printf '%s: ssh -p %s 127.0.0.1\n' "$PROG" "$local_port" >&2
+    fi
+fi
+
+# AWS-StartPortForwardingSession listens on 127.0.0.1 and forwards to the instance.
+params="{\"portNumber\":[\"$remote_port\"],\"localPortNumber\":[\"$local_port\"]}"
+
+exec aws ssm start-session \
+    --target "$INSTANCE_ID" \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters "$params"
+die "failed to start session"
